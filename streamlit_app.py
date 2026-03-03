@@ -1,4 +1,4 @@
-# pip install python-telegram-bot==20.8 duckdb requests apscheduler streamlit
+# pip install python-telegram-bot>=21.0 duckdb requests apscheduler streamlit
 
 import os
 import sys
@@ -7,6 +7,8 @@ import requests
 import duckdb
 import streamlit as st
 from datetime import datetime, timedelta
+import asyncio
+import threading
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -34,7 +36,7 @@ ADMIN_USER_ID = "你的Telegram数字ID"
     st.stop()
 
 # 数据库路径（使用可写目录）
-DB_DIR = st.cache_path if hasattr(st, 'cache_path') and st.cache_path else "/tmp"
+DB_DIR = "/tmp"  # Streamlit Cloud 使用 /tmp
 DB_FILE = os.path.join(DB_DIR, "url_monitor.duckdb")
 
 # ==================== 数据库管理 ====================
@@ -45,80 +47,120 @@ class Database:
     
     def get_conn(self):
         """获取新的数据库连接"""
-        return duckdb.connect(self.db_file)
+        try:
+            return duckdb.connect(self.db_file)
+        except Exception as e:
+            st.error(f"数据库连接失败: {e}")
+            if os.path.exists(self.db_file):
+                try:
+                    os.remove(self.db_file)
+                    st.warning("已删除损坏的数据库文件，将重新创建")
+                    return duckdb.connect(self.db_file)
+                except Exception as e2:
+                    st.error(f"无法删除数据库文件: {e2}")
+                    raise
+            raise
     
     def init_db(self):
         """初始化数据库表结构"""
+        if os.path.exists(self.db_file):
+            try:
+                test_conn = duckdb.connect(self.db_file)
+                test_conn.execute("SELECT 1").fetchone()
+                test_conn.close()
+            except Exception as e:
+                st.warning(f"检测到损坏的数据库文件，正在重建...")
+                try:
+                    os.remove(self.db_file)
+                    lock_file = self.db_file + ".wal"
+                    if os.path.exists(lock_file):
+                        os.remove(lock_file)
+                except Exception as e2:
+                    st.error(f"无法删除损坏的数据库: {e2}")
+                    self.db_file = os.path.join(DB_DIR, "url_monitor_backup.duckdb")
+                    st.warning(f"使用备用数据库路径: {self.db_file}")
+        
         conn = self.get_conn()
-        
-        conn.execute("""
-            CREATE SEQUENCE IF NOT EXISTS monitor_seq START 1
-        """)
-        
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS authorized_users (
-                user_id BIGINT PRIMARY KEY,
-                is_admin BOOLEAN,
-                expire_at TIMESTAMP,
-                added_at TIMESTAMP,
-                added_by BIGINT
-            )
-        """)
-        
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS monitored_urls (
-                id BIGINT DEFAULT nextval('monitor_seq'),
-                user_id BIGINT,
-                name TEXT,
-                url TEXT,
-                interval_seconds INTEGER,
-                enabled BOOLEAN,
-                last_status TEXT,
-                last_check_time TIMESTAMP,
-                PRIMARY KEY (id)
-            )
-        """)
-        
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS visit_logs (
-                monitor_id BIGINT,
-                status_code INTEGER,
-                response_time_ms INTEGER,
-                visit_time TIMESTAMP
-            )
-        """)
-        
-        # 检查并添加管理员
-        admin_exists = conn.execute("""
-            SELECT COUNT(*) FROM authorized_users WHERE user_id=?
-        """, [ADMIN_USER_ID]).fetchone()[0]
-        
-        if admin_exists == 0:
-            now = datetime.now()
+        try:
             conn.execute("""
-                INSERT INTO authorized_users
-                VALUES (?, true, ?, ?, ?)
-            """, [ADMIN_USER_ID, now + timedelta(days=3650), now, ADMIN_USER_ID])
-            conn.commit()
-            print(f"✅ 已创建管理员: {ADMIN_USER_ID}")
-        
-        conn.close()
+                CREATE SEQUENCE IF NOT EXISTS monitor_seq START 1
+            """)
+            
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS authorized_users (
+                    user_id BIGINT PRIMARY KEY,
+                    is_admin BOOLEAN,
+                    expire_at TIMESTAMP,
+                    added_at TIMESTAMP,
+                    added_by BIGINT
+                )
+            """)
+            
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS monitored_urls (
+                    id BIGINT DEFAULT nextval('monitor_seq'),
+                    user_id BIGINT,
+                    name TEXT,
+                    url TEXT,
+                    interval_seconds INTEGER,
+                    enabled BOOLEAN,
+                    last_status TEXT,
+                    last_check_time TIMESTAMP,
+                    PRIMARY KEY (id)
+                )
+            """)
+            
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS visit_logs (
+                    monitor_id BIGINT,
+                    status_code INTEGER,
+                    response_time_ms INTEGER,
+                    visit_time TIMESTAMP
+                )
+            """)
+            
+            admin_exists = conn.execute("""
+                SELECT COUNT(*) FROM authorized_users WHERE user_id=?
+            """, [ADMIN_USER_ID]).fetchone()[0]
+            
+            if admin_exists == 0:
+                now = datetime.now()
+                conn.execute("""
+                    INSERT INTO authorized_users
+                    VALUES (?, true, ?, ?, ?)
+                """, [ADMIN_USER_ID, now + timedelta(days=3650), now, ADMIN_USER_ID])
+                conn.commit()
+                print(f"✅ 已创建管理员: {ADMIN_USER_ID}")
+        except Exception as e:
+            st.error(f"初始化数据库失败: {e}")
+            raise
+        finally:
+            conn.close()
 
-# 全局数据库实例
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def get_db():
-    return Database(DB_FILE)
+    try:
+        return Database(DB_FILE)
+    except Exception as e:
+        st.error(f"数据库初始化失败: {e}")
+        return Database(":memory:")
 
-db = get_db()
+try:
+    db = get_db()
+except Exception as e:
+    st.error(f"无法初始化数据库: {e}")
+    st.stop()
 
 # ==================== 权限管理 ====================
 def get_user(uid):
     conn = db.get_conn()
-    result = conn.execute("""
-        SELECT is_admin, expire_at FROM authorized_users WHERE user_id=?
-    """, [uid]).fetchone()
-    conn.close()
-    return result
+    try:
+        result = conn.execute("""
+            SELECT is_admin, expire_at FROM authorized_users WHERE user_id=?
+        """, [uid]).fetchone()
+        return result
+    finally:
+        conn.close()
 
 def is_authorized(uid):
     r = get_user(uid)
@@ -162,7 +204,6 @@ def check_monitor_task(monitor_id, user_id, name, url):
         
         conn.commit()
         
-        # 如果状态异常，可以在这里添加 Telegram 通知逻辑
         if status == "DOWN":
             print(f"⚠️ 监控异常: {name} ({url}) - HTTP {code}")
             
@@ -186,7 +227,6 @@ def run_scheduled_checks():
         for row in rows:
             mid, uid, name, url, interval = row
             
-            # 检查是否需要运行（根据间隔时间）
             last_check = conn.execute("""
                 SELECT last_check_time FROM monitored_urls WHERE id=?
             """, [mid]).fetchone()
@@ -211,10 +251,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not user_info:
         await update.message.reply_text(
-            f"❌ 你没有权限使用此机器人\n"
-            f"你的 User ID: `{uid}`\n\n"
+            f"❌ 你没有权限使用此机器人\\n"
+            f"你的 User ID: `{uid}`\\n\\n"
             f"请联系管理员添加权限",
-            parse_mode='Markdown'
+            parse_mode='MarkdownV2'
         )
         return
     
@@ -222,28 +262,28 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     expire_at = user_info[1]
     
     basic_commands = (
-        f"👋 欢迎使用 URL 监控机器人!\n\n"
-        f"🆔 你的 User ID: `{uid}`\n"
-        f"👤 角色: {'👑 管理员' if is_admin_user else '👤 普通用户'}\n"
-        f"⏰ 权限过期: {expire_at:%Y-%m-%d %H:%M:%S}\n\n"
-        f"📋 **基本命令:**\n"
-        f"`/add <名称> <URL> <间隔秒数>` - 添加监控\n"
-        f"`/list` - 查看你的监控列表\n"
-        f"`/check [ID]` - 立即检查监控项\n"
+        f"👋 欢迎使用 URL 监控机器人!\\n\\n"
+        f"🆔 你的 User ID: `{uid}`\\n"
+        f"👤 角色: {'👑 管理员' if is_admin_user else '👤 普通用户'}\\n"
+        f"⏰ 权限过期: {expire_at:%Y-%m-%d %H:%M:%S}\\n\\n"
+        f"📋 **基本命令:**\\n"
+        f"`/add <名称> <URL> <间隔秒数>` - 添加监控\\n"
+        f"`/list` - 查看你的监控列表\\n"
+        f"`/check [ID]` - 立即检查监控项\\n"
         f"`/delete <ID>` - 删除监控项"
     )
     
     if is_admin_user:
         admin_commands = (
-            f"\n\n👑 **管理员命令:**\n"
-            f"`/adduser <user_id> <天数> [admin]` - 添加用户\n"
-            f"`/revoke <user_id>` - 撤销用户权限\n"
-            f"`/listusers` - 查看所有用户\n"
+            f"\\n\\n👑 **管理员命令:**\\n"
+            f"`/adduser <user_id> <天数> [admin]` - 添加用户\\n"
+            f"`/revoke <user_id>` - 撤销用户权限\\n"
+            f"`/listusers` - 查看所有用户\\n"
             f"`/listall` - 查看所有监控项"
         )
-        await update.message.reply_text(basic_commands + admin_commands, parse_mode='Markdown')
+        await update.message.reply_text(basic_commands + admin_commands, parse_mode='MarkdownV2')
     else:
-        await update.message.reply_text(basic_commands, parse_mode='Markdown')
+        await update.message.reply_text(basic_commands, parse_mode='MarkdownV2')
 
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -253,28 +293,29 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if len(context.args) < 3:
         await update.message.reply_text(
-            "❌ 用法: `/add <名称> <URL> <检查间隔秒数>`\n"
+            "❌ 用法: `/add <名称> <URL> <检查间隔秒数>`\\n"
             "示例: `/add 我的博客 https://example.com 300`",
-            parse_mode='Markdown'
+            parse_mode='MarkdownV2'
         )
         return
     
     try:
         name, url, sec = context.args[0], context.args[1], int(context.args[2])
         
-        # 验证 URL 格式
         if not url.startswith(('http://', 'https://')):
             await update.message.reply_text("❌ URL 必须以 http:// 或 https:// 开头")
             return
         
         conn = db.get_conn()
-        conn.execute("""
-            INSERT INTO monitored_urls
-            (user_id, name, url, interval_seconds, enabled)
-            VALUES (?, ?, ?, ?, true)
-        """, [uid, name, url, sec])
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute("""
+                INSERT INTO monitored_urls
+                (user_id, name, url, interval_seconds, enabled)
+                VALUES (?, ?, ?, ?, true)
+            """, [uid, name, url, sec])
+            conn.commit()
+        finally:
+            conn.close()
         
         await update.message.reply_text(f"✅ 已添加监控: **{name}**", parse_mode='Markdown')
     except Exception as e:
@@ -309,12 +350,12 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         status_emoji = "🟢" if r[3]=='UP' else ("🔴" if r[3]=='DOWN' else "⚪")
         await update.message.reply_text(
-            f"{status_emoji} **{r[1]}**\n"
-            f"🆔 ID: `{r[0]}`\n"
-            f"🔗 {r[2]}\n"
-            f"📊 状态: {r[3] or 'UNKNOWN'}\n"
+            f"{status_emoji} **{r[1]}**\\n"
+            f"🆔 ID: `{r[0]}`\\n"
+            f"🔗 {r[2]}\\n"
+            f"📊 状态: {r[3] or 'UNKNOWN'}\\n"
             f"🕐 最后检查: {r[4] or '未检查'}",
-            parse_mode='Markdown',
+            parse_mode='MarkdownV2',
             disable_web_page_preview=True
         )
 
@@ -361,7 +402,6 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mid, _, name, url = r
         status, code, cost = check_url(url)
         
-        # 更新数据库
         conn = db.get_conn()
         try:
             now = datetime.now()
@@ -377,14 +417,14 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         status_emoji = "🟢" if status=="UP" else "🔴"
         await update.message.reply_text(
-            f"{status_emoji} **{name}**\n"
-            f"🆔 ID: `{mid}`\n"
-            f"🔗 {url}\n"
-            f"📊 状态: {status}\n"
-            f"📡 HTTP: {code}\n"
-            f"⏱️ 耗时: {cost} ms\n"
+            f"{status_emoji} **{name}**\\n"
+            f"🆔 ID: `{mid}`\\n"
+            f"🔗 {url}\\n"
+            f"📊 状态: {status}\\n"
+            f"📡 HTTP: {code}\\n"
+            f"⏱️ 耗时: {cost} ms\\n"
             f"🕐 {now:%Y-%m-%d %H:%M:%S}",
-            parse_mode='Markdown',
+            parse_mode='MarkdownV2',
             disable_web_page_preview=True
         )
 
@@ -402,7 +442,6 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         monitor_id = int(context.args[0])
         conn = db.get_conn()
         try:
-            # 检查权限
             if is_admin(uid):
                 result = conn.execute("""
                     SELECT name FROM monitored_urls WHERE id=?
@@ -425,7 +464,6 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ 删除失败: {str(e)}")
 
-# ==================== 管理员命令 ====================
 async def adduser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
@@ -434,10 +472,10 @@ async def adduser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if len(context.args) < 2:
         await update.message.reply_text(
-            "❌ 用法: `/adduser <user_id> <过期天数> [admin]`\n"
-            "示例: `/adduser 123456789 30`\n"
+            "❌ 用法: `/adduser <user_id> <过期天数> [admin]`\\n"
+            "示例: `/adduser 123456789 30`\\n"
             "示例: `/adduser 123456789 30 admin`",
-            parse_mode='Markdown'
+            parse_mode='MarkdownV2'
         )
         return
     
@@ -474,13 +512,13 @@ async def adduser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         role = "👑 管理员" if is_admin_flag else "👤 普通用户"
         await update.message.reply_text(
-            f"✅ 已{action}用户\n\n"
-            f"🆔 用户ID: `{target_uid}`\n"
-            f"👤 角色: {role}\n"
-            f"⏰ 过期时间: {expire_at:%Y-%m-%d %H:%M:%S}\n"
-            f"🕐 添加时间: {now:%Y-%m-%d %H:%M:%S}\n"
+            f"✅ 已{action}用户\\n\\n"
+            f"🆔 用户ID: `{target_uid}`\\n"
+            f"👤 角色: {role}\\n"
+            f"⏰ 过期时间: {expire_at:%Y-%m-%d %H:%M:%S}\\n"
+            f"🕐 添加时间: {now:%Y-%m-%d %H:%M:%S}\\n"
             f"👤 添加者: {uid}",
-            parse_mode='Markdown'
+            parse_mode='MarkdownV2'
         )
     except Exception as e:
         await update.message.reply_text(f"❌ 添加失败: {str(e)}")
@@ -517,7 +555,7 @@ async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             conn.close()
         
-        await update.message.reply_text(f"✅ 已撤销用户 `{target_uid}` 的权限", parse_mode='Markdown')
+        await update.message.reply_text(f"✅ 已撤销用户 `{target_uid}` 的权限", parse_mode='MarkdownV2')
     except Exception as e:
         await update.message.reply_text(f"❌ 撤销失败: {str(e)}")
 
@@ -542,7 +580,6 @@ async def listall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 没有任何监控项")
         return
     
-    # 分批发送避免消息过长
     current_user = None
     messages = []
     current_msg = ""
@@ -554,23 +591,23 @@ async def listall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if current_msg:
                 messages.append(current_msg)
             current_user = owner_uid
-            current_msg = f"👤 用户 `{owner_uid}` 的监控项:\n\n"
+            current_msg = f"👤 用户 `{owner_uid}` 的监控项:\\n\\n"
         
         status_emoji = "🟢" if status == "UP" else ("🔴" if status == "DOWN" else "⚪")
         enabled_emoji = "✅" if enabled else "❌"
         
         item_text = (
-            f"{status_emoji} **{name}** [{enabled_emoji}]\n"
-            f"  🆔 `{mid}`\n"
-            f"  🔗 {url}\n"
-            f"  📊 {status or 'UNKNOWN'}\n"
-            f"  ⏱️ {interval}秒\n"
-            f"  🕐 {last_check or '未检查'}\n\n"
+            f"{status_emoji} **{name}** [{enabled_emoji}]\\n"
+            f"  🆔 `{mid}`\\n"
+            f"  🔗 {url}\\n"
+            f"  📊 {status or 'UNKNOWN'}\\n"
+            f"  ⏱️ {interval}秒\\n"
+            f"  🕐 {last_check or '未检查'}\\n\\n"
         )
         
         if len(current_msg) + len(item_text) > 3500:
             messages.append(current_msg)
-            current_msg = f"👤 用户 `{owner_uid}` 的监控项 (续):\n\n" + item_text
+            current_msg = f"👤 用户 `{owner_uid}` 的监控项 (续):\\n\\n" + item_text
         else:
             current_msg += item_text
     
@@ -578,7 +615,7 @@ async def listall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages.append(current_msg)
     
     for msg in messages:
-        await update.message.reply_text(msg, parse_mode='Markdown', disable_web_page_preview=True)
+        await update.message.reply_text(msg, parse_mode='MarkdownV2', disable_web_page_preview=True)
 
 async def listusers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -600,77 +637,111 @@ async def listusers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 没有授权用户")
         return
     
-    msg = "👥 **授权用户列表:**\n\n"
+    msg = "👥 **授权用户列表:**\\n\\n"
     for r in rows:
         user_id, is_admin_flag, expire_at, added_at, added_by = r
         role = "👑 管理员" if is_admin_flag else "👤 普通用户"
         expired = "❌ 已过期" if expire_at < datetime.now() else "✅ 有效"
         
         user_text = (
-            f"{role} `{user_id}` [{expired}]\n"
-            f"  ⏰ 过期: {expire_at:%Y-%m-%d}\n"
-            f"  🕐 添加: {added_at:%Y-%m-%d}\n"
-            f"  👤 添加者: `{added_by}`\n\n"
+            f"{role} `{user_id}` [{expired}]\\n"
+            f"  ⏰ 过期: {expire_at:%Y-%m-%d}\\n"
+            f"  🕐 添加: {added_at:%Y-%m-%d}\\n"
+            f"  👤 添加者: `{added_by}`\\n\\n"
         )
         
         if len(msg) + len(user_text) > 3500:
-            await update.message.reply_text(msg, parse_mode='Markdown')
-            msg = "👥 **授权用户列表 (续):**\n\n" + user_text
+            await update.message.reply_text(msg, parse_mode='MarkdownV2')
+            msg = "👥 **授权用户列表 (续):**\\n\\n" + user_text
         else:
             msg += user_text
     
-    await update.message.reply_text(msg, parse_mode='Markdown')
+    await update.message.reply_text(msg, parse_mode='MarkdownV2')
 
 # ==================== 后台调度器 ====================
 def start_scheduler():
     """启动后台定时调度器"""
     scheduler = BackgroundScheduler()
-    # 每分钟检查一次需要运行的监控任务
     scheduler.add_job(run_scheduled_checks, 'interval', minutes=1, id='monitor_job')
     scheduler.start()
     return scheduler
 
-# ==================== Streamlit UI ====================
-def init_telegram_bot():
-    """初始化并运行 Telegram Bot"""
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    # 添加命令处理器
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("add", add_cmd))
-    app.add_handler(CommandHandler("list", list_cmd))
-    app.add_handler(CommandHandler("check", check_cmd))
-    app.add_handler(CommandHandler("delete", delete_cmd))
-    
-    # 管理员命令
-    app.add_handler(CommandHandler("adduser", adduser_cmd))
-    app.add_handler(CommandHandler("revoke", revoke_cmd))
-    app.add_handler(CommandHandler("listall", listall_cmd))
-    app.add_handler(CommandHandler("listusers", listusers_cmd))
-    
-    return app
+# ==================== Telegram Bot 启动（修复版）====================
+async def run_bot_async():
+    """异步运行 Bot"""
+    try:
+        # 使用 Application.builder() 创建应用（v21+ 语法）
+        application = (
+            Application.builder()
+            .token(BOT_TOKEN)
+            .build()
+        )
+        
+        # 添加处理器
+        application.add_handler(CommandHandler("start", start_cmd))
+        application.add_handler(CommandHandler("add", add_cmd))
+        application.add_handler(CommandHandler("list", list_cmd))
+        application.add_handler(CommandHandler("check", check_cmd))
+        application.add_handler(CommandHandler("delete", delete_cmd))
+        application.add_handler(CommandHandler("adduser", adduser_cmd))
+        application.add_handler(CommandHandler("revoke", revoke_cmd))
+        application.add_handler(CommandHandler("listall", listall_cmd))
+        application.add_handler(CommandHandler("listusers", listusers_cmd))
+        
+        # 初始化并启动
+        await application.initialize()
+        await application.start()
+        
+        # 使用 Updater 进行 polling（v21+ 语法）
+        await application.updater.start_polling(drop_pending_updates=True)
+        
+        # 保持运行
+        while True:
+            await asyncio.sleep(1)
+            
+    except Exception as e:
+        print(f"Bot 运行错误: {e}")
+        import traceback
+        traceback.print_exc()
 
-# ==================== 主界面 ====================
+def run_bot():
+    """在线程中运行异步 Bot"""
+    try:
+        asyncio.run(run_bot_async())
+    except Exception as e:
+        print(f"Bot 线程错误: {e}")
+
+# ==================== Streamlit UI ====================
 def main():
     st.title("🤖 Telegram URL 监控机器人")
     st.markdown("---")
     
-    # 侧边栏信息
     with st.sidebar:
         st.header("📊 系统状态")
+        
+        try:
+            test_conn = db.get_conn()
+            test_conn.execute("SELECT 1").fetchone()
+            test_conn.close()
+            st.success("💾 数据库连接正常")
+        except Exception as e:
+            st.error(f"💾 数据库异常: {e}")
+        
         st.success(f"🤖 Bot 已启动")
         st.info(f"👑 管理员 ID: `{ADMIN_USER_ID}`")
-        st.info(f"💾 数据库: `{DB_FILE}`")
+        st.info(f"💾 数据库路径: `{DB_FILE}`")
         
-        # 显示统计信息
-        conn = db.get_conn()
         try:
-            user_count = conn.execute("SELECT COUNT(*) FROM authorized_users").fetchone()[0]
-            monitor_count = conn.execute("SELECT COUNT(*) FROM monitored_urls WHERE enabled=true").fetchone()[0]
-            st.metric("👥 授权用户", user_count)
-            st.metric("📡 活跃监控", monitor_count)
-        finally:
-            conn.close()
+            conn = db.get_conn()
+            try:
+                user_count = conn.execute("SELECT COUNT(*) FROM authorized_users").fetchone()[0]
+                monitor_count = conn.execute("SELECT COUNT(*) FROM monitored_urls WHERE enabled=true").fetchone()[0]
+                st.metric("👥 授权用户", user_count)
+                st.metric("📡 活跃监控", monitor_count)
+            finally:
+                conn.close()
+        except Exception as e:
+            st.error(f"无法获取统计: {e}")
         
         st.markdown("---")
         st.markdown("### 📝 使用说明")
@@ -680,8 +751,16 @@ def main():
         3. 使用 `/add` 添加监控URL
         4. 系统每分钟自动检查一次
         """)
+        
+        if st.button("🗑️ 重置数据库", type="secondary"):
+            if os.path.exists(DB_FILE):
+                try:
+                    os.remove(DB_FILE)
+                    st.warning("数据库已重置，请刷新页面")
+                    st.stop()
+                except Exception as e:
+                    st.error(f"无法删除数据库: {e}")
     
-    # 主界面标签页
     tab1, tab2, tab3 = st.tabs(["🚀 控制面板", "📋 监控列表", "📜 日志"])
     
     with tab1:
@@ -693,75 +772,86 @@ def main():
             st.markdown("#### 📡 实时监控状态")
             if st.button("🔍 立即检查所有监控", type="primary"):
                 with st.spinner("正在检查..."):
-                    run_scheduled_checks()
-                    st.success("✅ 检查完成！")
-                    st.rerun()
+                    try:
+                        run_scheduled_checks()
+                        st.success("✅ 检查完成！")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"检查失败: {e}")
         
         with col2:
             st.markdown("#### ⚙️ 系统操作")
             if st.button("🗑️ 清理旧日志"):
-                conn = db.get_conn()
                 try:
-                    # 保留最近30天的日志
-                    cutoff = datetime.now() - timedelta(days=30)
-                    conn.execute("DELETE FROM visit_logs WHERE visit_time < ?", [cutoff])
-                    conn.commit()
-                    st.success("✅ 已清理旧日志")
-                finally:
-                    conn.close()
+                    conn = db.get_conn()
+                    try:
+                        cutoff = datetime.now() - timedelta(days=30)
+                        conn.execute("DELETE FROM visit_logs WHERE visit_time < ?", [cutoff])
+                        conn.commit()
+                        st.success("✅ 已清理旧日志")
+                    finally:
+                        conn.close()
+                except Exception as e:
+                    st.error(f"清理失败: {e}")
         
         st.markdown("---")
         st.subheader("📊 最近检查记录")
         
-        conn = db.get_conn()
         try:
-            logs = conn.execute("""
-                SELECT v.monitor_id, m.name, v.status_code, v.response_time_ms, v.visit_time
-                FROM visit_logs v
-                JOIN monitored_urls m ON v.monitor_id = m.id
-                ORDER BY v.visit_time DESC
-                LIMIT 20
-            """).fetchall()
-            
-            if logs:
-                import pandas as pd
-                df = pd.DataFrame(logs, columns=['ID', '名称', 'HTTP状态', '响应时间(ms)', '检查时间'])
-                st.dataframe(df, use_container_width=True)
-            else:
-                st.info("暂无检查记录")
-        finally:
-            conn.close()
+            conn = db.get_conn()
+            try:
+                logs = conn.execute("""
+                    SELECT v.monitor_id, m.name, v.status_code, v.response_time_ms, v.visit_time
+                    FROM visit_logs v
+                    JOIN monitored_urls m ON v.monitor_id = m.id
+                    ORDER BY v.visit_time DESC
+                    LIMIT 20
+                """).fetchall()
+                
+                if logs:
+                    import pandas as pd
+                    df = pd.DataFrame(logs, columns=['ID', '名称', 'HTTP状态', '响应时间(ms)', '检查时间'])
+                    st.dataframe(df, use_container_width=True)
+                else:
+                    st.info("暂无检查记录")
+            finally:
+                conn.close()
+        except Exception as e:
+            st.error(f"无法加载日志: {e}")
     
     with tab2:
         st.subheader("📋 所有监控项")
         
-        conn = db.get_conn()
         try:
-            monitors = conn.execute("""
-                SELECT m.id, m.name, m.url, m.interval_seconds, m.last_status, m.last_check_time, u.user_id
-                FROM monitored_urls m
-                LEFT JOIN authorized_users u ON m.user_id = u.user_id
-                WHERE m.enabled = true
-                ORDER BY m.id DESC
-            """).fetchall()
-            
-            if monitors:
-                for m in monitors:
-                    mid, name, url, interval, status, last_check, owner = m
-                    
-                    status_color = "green" if status == "UP" else ("red" if status == "DOWN" else "gray")
-                    
-                    with st.container():
-                        cols = st.columns([3, 1, 1, 1])
-                        cols[0].markdown(f"**{name}**  \n`{url}`")
-                        cols[1].markdown(f"⏱️ {interval}秒")
-                        cols[2].markdown(f":{status_color}[{status or 'UNKNOWN'}]")
-                        cols[3].markdown(f"👤 `{owner}`")
-                        st.divider()
-            else:
-                st.info("暂无监控项")
-        finally:
-            conn.close()
+            conn = db.get_conn()
+            try:
+                monitors = conn.execute("""
+                    SELECT m.id, m.name, m.url, m.interval_seconds, m.last_status, m.last_check_time, u.user_id
+                    FROM monitored_urls m
+                    LEFT JOIN authorized_users u ON m.user_id = u.user_id
+                    WHERE m.enabled = true
+                    ORDER BY m.id DESC
+                """).fetchall()
+                
+                if monitors:
+                    for m in monitors:
+                        mid, name, url, interval, status, last_check, owner = m
+                        
+                        status_color = "green" if status == "UP" else ("red" if status == "DOWN" else "gray")
+                        
+                        with st.container():
+                            cols = st.columns([3, 1, 1, 1])
+                            cols[0].markdown(f"**{name}**  \\n`{url}`")
+                            cols[1].markdown(f"⏱️ {interval}秒")
+                            cols[2].markdown(f":{status_color}[{status or 'UNKNOWN'}]")
+                            cols[3].markdown(f"👤 `{owner}`")
+                            st.divider()
+                else:
+                    st.info("暂无监控项")
+            finally:
+                conn.close()
+        except Exception as e:
+            st.error(f"无法加载监控列表: {e}")
     
     with tab3:
         st.subheader("📜 系统日志")
@@ -769,25 +859,21 @@ def main():
 
 # ==================== 启动逻辑 ====================
 if __name__ == "__main__":
-    # 启动后台调度器（只在主线程执行一次）
+    # 启动后台调度器
     if "scheduler_started" not in st.session_state:
-        scheduler = start_scheduler()
-        st.session_state.scheduler_started = True
-        st.session_state.scheduler = scheduler
-        print("✅ 后台调度器已启动")
+        try:
+            scheduler = start_scheduler()
+            st.session_state.scheduler_started = True
+            st.session_state.scheduler = scheduler
+            print("✅ 后台调度器已启动")
+        except Exception as e:
+            st.error(f"调度器启动失败: {e}")
     
-    # 在单独线程中运行 Telegram Bot（非阻塞）
+    # 在单独线程中运行 Telegram Bot
     if "bot_thread" not in st.session_state:
-        import threading
-        
-        def run_bot():
-            app = init_telegram_bot()
-            app.run_polling(drop_pending_updates=True)
-        
         bot_thread = threading.Thread(target=run_bot, daemon=True)
         bot_thread.start()
         st.session_state.bot_thread = bot_thread
         print("✅ Telegram Bot 线程已启动")
     
-    # 运行 Streamlit UI
     main()
