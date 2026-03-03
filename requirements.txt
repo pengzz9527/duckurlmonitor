@@ -1,0 +1,6 @@
+streamlit>=1.28.0
+python-telegram-bot==20.8
+duckdb>=0.9.0
+requests>=2.31.0
+apscheduler>=3.10.0
+pandas>=2.0.0
