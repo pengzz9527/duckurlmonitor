@@ -832,7 +832,7 @@ try:
             with st.sidebar.expander("➕ 添加用户"):
                 new_id = st.number_input("用户ID", step=1, value=0)
                 new_days = st.number_input("有效期(天)", min_value=1, value=30)
-                new_admin = st.checkbox("设为管理员")
+
                 
                 if st.button("确认添加"):
                     # 这里需要调用实际的数据库操作
@@ -917,3 +917,4 @@ finally:
     conn.close()
 
 st.info("🤖 Bot 运行中...")
+
