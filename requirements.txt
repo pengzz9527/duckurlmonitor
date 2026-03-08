@@ -4,3 +4,4 @@ requests>=2.31.0
 apscheduler>=3.10.0
 streamlit>=1.28.0
 pandas>=2.0.0
+boto3
