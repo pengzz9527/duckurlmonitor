@@ -842,7 +842,7 @@ try:
                         conn.execute("""
                         INSERT OR REPLACE INTO authorized_users (user_id, is_admin, expire_at, added_at, added_by)
                         VALUES(?,?,?,?,?)
-                        """, [int(new_id), new_admin, expire, datetime.now(), current_uid])
+                        """, [int(new_id), 0, expire, datetime.now(), current_uid])
                         conn.commit()
                         upload_db()
                         st.sidebar.success("✅ 添加成功")
@@ -917,4 +917,5 @@ finally:
     conn.close()
 
 st.info("🤖 Bot 运行中...")
+
 
